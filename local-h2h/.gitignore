@@ -1,0 +1,10 @@
+# runtime state and raw results stay local (not in git)
+*.log
+*.out
+*.jsonl
+samp-*.txt
+cfg-*.json
+englog-*
+prompts/
+prod/
+STOP-sampler

@@ -1,0 +1,52 @@
+#!/bin/bash
+# ds-switch {upstream|ds41e|status}: which DeepSeek engine serves bigrig:8150. Stops the one running (gracefully),
+# waits for VRAM < 1 GB and MemAvailable > 110 GB, starts the other via its restart-lan.sh, then checks that :8150
+# answers 401 without the key and a keyed chat request works. Takes ~/bigrig-gpu.lock itself (waits for a running
+# benchmark to finish first).
+set -u
+UPH=$HOME/code/strata-up/local-h2h
+DS=$HOME/code/ds41e
+want=${1:-}
+current() {
+    if pgrep -f "[s]trata-up/serve/server.py" >/dev/null; then echo upstream
+    elif pgrep -f "[s]erve_ds41.py" >/dev/null; then echo ds41e
+    else echo none; fi
+}
+verify() {
+    local code key out
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 http://127.0.0.1:8150/v1/models)
+    key=$(cat "$HOME/.config/ds41e/api-key")
+    out=$(curl -s -m 300 http://127.0.0.1:8150/v1/chat/completions -H "Authorization: Bearer $key" \
+        -H 'Content-Type: application/json' \
+        -d '{"model":"local","messages":[{"role":"user","content":"Reply with the single word ready."}],"max_tokens":16,"reasoning_effort":"none"}')
+    if [ "$code" = 401 ] && echo "$out" | grep -q '"choices"'; then
+        echo "verified: $(current) on :8150, 401 without key, keyed request answered"
+        return 0
+    fi
+    echo "VERIFY FAILED: no-key status $code; keyed reply: $(echo "$out" | head -c 300)"
+    return 1
+}
+case $want in
+    status) echo "serving: $(current)"; exit 0 ;;
+    upstream|ds41e) ;;
+    *) echo "usage: ds-switch {upstream|ds41e|status}"; exit 2 ;;
+esac
+exec 9>"$HOME/bigrig-gpu.lock"
+echo "waiting for the GPU lock ..."
+flock 9
+echo "serving now: $(current); switching to $want"
+if [ "$want" = upstream ]; then
+    "$UPH/restart-lan.sh" || exit 1      # (stops ds41e and any upstream first, waits for memory)
+else
+    if [ "$(current)" = upstream ]; then
+        pkill -TERM -f "[s]trata-up/serve/server.py"
+        i=0
+        while pgrep -f "[s]trata-up/serve/server.py|[s]trata-up/build-dsv41-hip/strata-dsv41" >/dev/null && [ $i -lt 60 ]; do
+            sleep 2; i=$((i + 1))
+        done
+        pkill -KILL -f "[s]trata-up/serve/server.py|[s]trata-up/build-dsv41-hip/strata-dsv41" 2>/dev/null
+    fi
+    "$DS/local/restart-lan.sh" || exit 1   # (stops ds41e, waits for memory, starts run-lan.sh)
+fi
+exec 9>&-
+verify

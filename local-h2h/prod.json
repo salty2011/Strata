@@ -1,0 +1,57 @@
+{
+ "exe": "/home/michael/code/strata-up/build-dsv41-hip/strata-dsv41",
+ "args": [
+  "--pack",
+  "/srv/models/strata-up/data/packs/deepseek-v4.1-flash-ist-das-2.00bpw",
+  "--max-context",
+  "262144",
+  "--eos",
+  "1",
+  "--vision",
+  "off",
+  "--dspark",
+  "auto",
+  "--dspark-conf",
+  "0.65",
+  "--ssd-cache",
+  "116"
+ ],
+ "cwd": "/home/michael/code/strata-up",
+ "tokenizer": "/srv/models/strata-up/data/packs/deepseek-v4.1-flash-ist-das-2.00bpw/tokenizer",
+ "model_name": "deepseek-v4.1-flash",
+ "arch": "deepseek41",
+ "log": "/home/michael/code/strata-up/local-h2h/prod/engine.log",
+ "lib_dirs": [
+  "/home/michael/code/strata-up/build-dsv41-hip"
+ ],
+ "port": 8150,
+ "engine_ready_s": 3600,
+ "backend": "hip",
+ "open_browser": false,
+ "args_written": [
+  "--pack",
+  "/srv/models/strata-up/data/packs/deepseek-v4.1-flash-ist-das-2.00bpw",
+  "--max-context",
+  "262144",
+  "--eos",
+  "1",
+  "--vision",
+  "off",
+  "--dspark",
+  "auto",
+  "--dspark-conf",
+  "0.65",
+  "--ssd-cache",
+  "116"
+ ],
+ "aliases": [
+  "local"
+ ],
+ "env": {
+  "STRATA_DSV41_LOOKUP": "12",
+  "STRATA_DSV41_LOOKUP_GATE": "3",
+  "STRATA_DSV41_LOOKUP_NGRAM": "4",
+  "STRATA_DS4_SLOT_GB": "8",
+  "STRATA_DS4_SLOT_DIR": "/home/michael/code/strata-up/local-h2h/prod/ds4-slots"
+ }
+}
