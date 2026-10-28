@@ -51,6 +51,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -273,8 +274,89 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     return true;
 }
 
+// ---- local addition: lookup drafts in the serve decode (ported from ds41e d6099a79, STRATA_SERVE_LOOKUP) -----------
+// The up to K tokens that followed the latest earlier occurrence of the last N tokens (prompt + answer so far) are
+// drafts, verified in one window by Model::verify() - the speculative-sampling rule with q a point at each draft (the
+// same rule as the drafter's argmax drafts), so the output is distributed as plain sampling's and at temperature 0 the
+// tokens are the argmax ones.  A verify window over mostly CPU-side experts costs about a plain step, so a wrong draft
+// is paid in full: drafts go only after the last `gate` emitted tokens were all what the lookup predicted (checked for
+// free on every emitted token: the lookup's next token vs the one that came) - new text rarely gets there, copied text
+// (an edit that rewrites a file) stays there.  The width adapts: a full accept doubles it up to K, a rejection shrinks
+// it to what was accepted (at least 2).  verify() rolls a rejected window back itself (ring rows and compressor
+// state), so ds41e's odd-position re-feed rule is not needed here; this engine has no repetition penalties, so there
+// is no penalty window to keep either.
+// STRATA_DSV41_LOOKUP=K (0 off, at most 15: a window is 16) / _GATE=g (3) / _NGRAM=n (4) / _ADAPT=0|1 (1); ds41e's
+// names STRATA_SERVE_LOOKUP / STRATA_SERVE_LOOKUP_GATE / STRATA_LOOKUP_NGRAM / STRATA_LOOKUP_ADAPT are read when the
+// new ones are not set.  A request's lookup=K key overrides K (0: off for that request).
+struct LookupCfg {
+    int k = 0, ngram = 4, gate = 3;
+    bool adapt = true;
+};
+static LookupCfg g_lk;
+static const char* env2(const char* a, const char* b) {
+    const char* v = std::getenv(a);
+    return v != nullptr ? v : std::getenv(b);
+}
+struct Lookup {
+    int n = 4, gate = 3, kmax = 0, k_cur = 2;
+    bool adapt = true;
+    std::vector<int> h;                        // prompt + emitted tokens
+    std::unordered_map<uint64_t, int> last;    // n-gram -> the end index of its latest earlier occurrence
+    size_t indexed = 0;
+    int streak = 0, pred = -1, src = -1;       // emitted tokens the lookup predicted in a row; its guess; where from
+    long passes = 0, accepted = 0, drafted = 0, plain = 0;
+    double verify_ms = 0;
+    uint64_t key(size_t end) const {
+        uint64_t x = 1469598103934665603ull;
+        for (size_t i = end - (size_t) n; i < end; ++i) x = (x ^ (uint64_t) (uint32_t) h[i]) * 1099511628211ull;
+        return x;
+    }
+    void index() {   // every n-gram but the one ending at the end (that one is the query)
+        for (; indexed < h.size(); ++indexed) last[key(indexed)] = (int) indexed;
+    }
+    void start(const std::vector<int>& prompt, int k, const LookupCfg& c) {
+        n = std::max(1, c.ngram), gate = std::max(0, c.gate), kmax = k, adapt = c.adapt;
+        k_cur = std::min(2, kmax);
+        h.assign(prompt.begin(), prompt.end());
+        last.clear();
+        last.reserve(h.size() + 4096);
+        indexed = (size_t) n;
+        index();
+        streak = 0, pred = -1, src = -1;
+        passes = accepted = drafted = plain = 0;
+        verify_ms = 0;
+    }
+    void push(int t) {   // an emitted token: the gate's count, then the lookup for the token after it
+        streak = (pred >= 0 && pred == t) ? streak + 1 : 0;
+        h.push_back(t);
+        src = pred = -1;
+        if (h.size() > (size_t) n) {
+            const auto it = last.find(key(h.size()));
+            if (it != last.end()) {
+                src = it->second;
+                pred = h[(size_t) src];
+            }
+        }
+        index();
+    }
+    // the drafts after the last emitted token (none: the gate is shut or nothing matched); `cap` the most the round takes
+    void drafts(int cap, int img_tok, std::vector<int>& d) const {
+        d.clear();
+        if (src < 0 || streak < gate) return;
+        const int want = std::min(adapt ? k_cur : kmax, cap);
+        for (size_t j = (size_t) src; (int) d.size() < want && j < h.size(); ++j) {
+            if (h[j] == img_tok) break;   // (a picture's span is never a draft: its rows are not the embedding table's)
+            d.push_back(h[j]);
+        }
+    }
+    void verified(int k, int acc, double ms) {
+        ++passes, accepted += acc, drafted += k, verify_ms += ms;
+        if (adapt) k_cur = acc == k ? std::min(kmax, 2 * k) : std::max(2, acc);
+    }
+};
 struct Req {
     long long max_new = 0;
+    int lookup = -1;        // lookup=K: this request's lookup drafts, at most K a round (0: none; -1: the engine's)
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
     unsigned long long seed = 0;
@@ -381,6 +463,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "pin") r.pin = std::atoll(v.c_str());
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
+        else if (k == "lookup") r.lookup = std::max(0, std::min(15, std::atoi(v.c_str())));
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -391,6 +474,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
+    if (g_lk.k > 0)
+        std::fprintf(stderr, "ds4 serve: lookup drafts on (K %d, n-gram %d, gate %d, %s)\n", g_lk.k, g_lk.ngram,
+                     g_lk.gate, g_lk.adapt ? "adaptive" : "fixed width");
+    Lookup lk;
+    std::vector<int> lk_d;
+    long lk_all_passes = 0, lk_all_acc = 0;
     Lines in;
     in.start();
     std::string line;
@@ -911,6 +1000,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         bool cool = false;
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
+        const int lk_k = r.lookup >= 0 ? r.lookup : g_lk.k;
+        if (lk_k > 0) lk.start(r.ids, lk_k, g_lk);
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
         // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
         // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
@@ -959,22 +1050,42 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             if (produced >= limit || m.pos() >= m.max_context()) break;
+            if (lk_k > 0) lk.push(tok);   // (the lookup's history: every emitted token, the gate counted on it)
             if (got.empty()) {   // the next round: the drafts (if any) and the token after them
                 const int room = (int) std::min<long long>(limit - produced, m.max_context() - m.pos());
                 int off = 0, acc = 0;
-                // a round whose drafts were all below the confidence floor: the next one does without the drafter
-                // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
-                const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
-                if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
-                           r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum)) {
-                    std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    finish = "cancel";
-                    break;
+                // lookup drafts first, when the gate is open: [tok, drafts] verified in one window (verify() keeps the
+                // accepted ones, rolls the rest back, and gives the token after them); else the round as before
+                lk_d.clear();
+                if (lk_k > 0 && room > 1) lk.drafts(std::min(room - 1, 15), img_tok, lk_d);
+                if (!lk_d.empty()) {
+                    int next = -1;
+                    const double tv = now_ms();
+                    if (!m.verify(tok, lk_d, r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter, acc, next, err)) {
+                        std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                        finish = "cancel";
+                        break;
+                    }
+                    lk.verified((int) lk_d.size(), acc, now_ms() - tv);
+                    counter += (unsigned long long) acc + 1;
+                    for (int i = 0; i < acc; ++i) got.push_back(lk_d[(size_t) i]);
+                    got.push_back(next);
+                } else {
+                    if (lk_k > 0) ++lk.plain;
+                    // a round whose drafts were all below the confidence floor: the next one does without the drafter
+                    // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
+                    const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
+                    if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
+                               r.min_p, r.seed, counter, got,
+                               off, acc, err, r.cum)) {
+                        std::fprintf(stderr, "ds4: %s\n", err.c_str());
+                        finish = "cancel";
+                        break;
+                    }
+                    d_off += off;
+                    d_acc += acc;
+                    cool = try_spec && off == 0;
                 }
-                d_off += off;
-                d_acc += acc;
-                cool = try_spec && off == 0;
                 std::reverse(got.begin(), got.end());
             }
             tok = got.back();
@@ -997,6 +1108,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (lk_k > 0) {
+            lk_all_passes += lk.passes, lk_all_acc += lk.accepted;
+            std::fprintf(stderr, "ds4 serve: lookup %ld verify passes, %ld plain rounds; %.2f drafts and %.2f accepted a "
+                         "pass, verify %.1f ms a pass; all requests %.2f accepted a pass\n", lk.passes, lk.plain,
+                         (double) lk.drafted / (double) std::max(1L, lk.passes),
+                         (double) lk.accepted / (double) std::max(1L, lk.passes),
+                         lk.verify_ms / (double) std::max(1L, lk.passes),
+                         (double) lk_all_acc / (double) std::max(1L, lk_all_passes));
+        }
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
@@ -1375,6 +1495,13 @@ int main(int argc, char** argv) {
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    if (serve_mode) {   // lookup drafts (see Lookup): the engine's default K, and the verify buffers a request's lookup=K needs
+        if (const char* v = env2("STRATA_DSV41_LOOKUP", "STRATA_SERVE_LOOKUP")) g_lk.k = std::max(0, std::min(15, std::atoi(v)));
+        if (const char* v = env2("STRATA_DSV41_LOOKUP_GATE", "STRATA_SERVE_LOOKUP_GATE")) g_lk.gate = std::max(0, std::atoi(v));
+        if (const char* v = env2("STRATA_DSV41_LOOKUP_NGRAM", "STRATA_LOOKUP_NGRAM")) g_lk.ngram = std::max(1, std::atoi(v));
+        if (const char* v = env2("STRATA_DSV41_LOOKUP_ADAPT", "STRATA_LOOKUP_ADAPT")) g_lk.adapt = v[0] != '0';
+        o.verify_bufs = true;
+    }
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {

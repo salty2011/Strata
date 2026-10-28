@@ -62,6 +62,9 @@ struct Options {
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
     // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files)
     int prefill_chunk = -1;
+    // a verify window's backups (the ring rows, the compressors' snapshots, the head's pick buffers) without the drafter:
+    // the server's lookup drafts (n-grams of the prompt and the answer) verify with verify() too (a few hundred KB)
+    bool verify_bufs = false;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;

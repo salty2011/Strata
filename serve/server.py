@@ -1447,6 +1447,10 @@ class StrataEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+            # (local) DeepSeek's lookup drafts for this request: at most N a round, 0 off (STRATA_DSV41_LOOKUP: the default)
+            lk = tune.get("lookup")
+            if isinstance(lk, int) and not isinstance(lk, bool) and 0 <= lk <= 15:
+                keys += f" lookup={lk}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

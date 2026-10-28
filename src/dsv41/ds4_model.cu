@@ -2606,7 +2606,7 @@ struct Model::Impl {
                 !dalloc(d, d.n_groups, 4, err))
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
-            if (g.n_mtp > 0 && (int) di == head_dev &&
+            if ((g.n_mtp > 0 || o.verify_bufs) && (int) di == head_dev &&   // (verify_bufs: lookup drafts, no drafter)
                 (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_ints, 64, err) || !dalloc(d, d_specq, kWin, err)))
                 return false;
             CK(cudaEventCreateWithFlags(&d.ev_out, cudaEventDisableTiming));
@@ -4168,7 +4168,7 @@ struct Model::Impl {
                 }
             }
             if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
-            if (g.n_mtp > 0 && !l.mtp) {
+            if ((g.n_mtp > 0 || o.verify_bufs) && !l.mtp) {   // (a verify window's backups: the drafter's or lookup drafts')
                 if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
                 if (l.kv_src && l.ratio > 1 && (!dalloc(d, l.c_snap, (size_t) 2 * l.ratio * g.hd, err) ||
                                                 !dalloc(d, l.c_rows, (size_t) 2 * kWin * g.hd, err)))
